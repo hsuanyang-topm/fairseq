@@ -53,12 +53,17 @@ class Trainer(object):
 
         # catalog shared parameters
         shared_params = _catalog_shared_params(model)
-        self.tpu = cfg.common.tpu
+        self.tpu = cfg.common.tpu and not torch.cuda.is_available()
         self.cuda = torch.cuda.is_available() and not cfg.common.cpu and not self.tpu
         if self.cuda:
             self.device = torch.device("cuda")
         elif self.tpu:
-            self.device = utils.get_tpu_device()
+            device = utils.get_tpu_device()
+            if device is None:
+                self.device = torch.device("cpu")
+                self.tpu = False
+            else:
+                self.device = device
         else:
             self.device = torch.device("cpu")
 
@@ -316,6 +321,8 @@ class Trainer(object):
                 )
             elif self.cfg.common.amp:
                 self._optimizer = optim.AMPOptimizer.build_optimizer(self.cfg, params)
+            elif self.cfg.common.bf16 and self.cuda:
+                self._optimizer = optim.build_optimizer(self.cfg.optimizer, params)
             else:
                 self._optimizer = optim.FP16Optimizer.build_optimizer(self.cfg, params)
         else:
@@ -529,9 +536,17 @@ class Trainer(object):
             assert (
                 last_optim["criterion_name"] == self.get_criterion().__class__.__name__
             ), f"Criterion does not match; please reset the optimizer (--reset-optimizer). {last_optim['criterion_name']} vs {self.get_criterion().__class__.__name__}"
-            assert (
-                last_optim["optimizer_name"] == self.optimizer.__class__.__name__
-            ), f"Optimizer does not match; please reset the optimizer (--reset-optimizer). {last_optim['optimizer_name']} vs {self.optimizer.__class__.__name__}"
+
+            if last_optim["optimizer_name"] != self.optimizer.__class__.__name__:
+                if (
+                    (self.cfg.common.bf16 or self.cfg.common.fp16 or self.cfg.common.amp)
+                    and last_optim["optimizer_name"] in ["FP16Optimizer", "MemoryEfficientFP16Optimizer", "AMPOptimizer"]
+                ):
+                    logger.warning(f"Optimizer name mismatch: {last_optim['optimizer_name']} vs {self.optimizer.__class__.__name__}. Allowing resume because fp16/bf16/amp is enabled.")
+                else:
+                    assert (
+                        last_optim["optimizer_name"] == self.optimizer.__class__.__name__
+                    ), f"Optimizer does not match; please reset the optimizer (--reset-optimizer). {last_optim['optimizer_name']} vs {self.optimizer.__class__.__name__}"
 
             if not reset_lr_scheduler:
                 self.lr_scheduler.load_state_dict(last_optim["lr_scheduler_state"])
@@ -546,7 +561,16 @@ class Trainer(object):
                     last_optim_state
                 )
 
-            self.optimizer.load_state_dict(last_optim_state, optimizer_overrides)
+            try:
+                self.optimizer.load_state_dict(last_optim_state, optimizer_overrides)
+            except ValueError as e:
+                if (
+                    (self.cfg.common.bf16 or self.cfg.common.fp16 or self.cfg.common.amp)
+                    and last_optim["optimizer_name"] in ["FP16Optimizer", "MemoryEfficientFP16Optimizer", "AMPOptimizer"]
+                ):
+                     logger.warning(f"Optimizer state dict mismatch: {e}. Resetting optimizer because fp16/bf16/amp is enabled and optimizer structure likely changed (e.g. flattened params).")
+                else:
+                    raise e
 
             self.set_num_updates(last_optim["num_updates"])
 
@@ -715,6 +739,10 @@ class Trainer(object):
     @metrics.aggregate("train")
     def train_step(self, samples, raise_oom=False):
         """Do forward, backward and parameter update."""
+        if self.get_num_updates() == 0:
+            p = next(self.model.parameters())
+            logger.info(f"DEBUG: Model parameter dtype: {p.dtype}")
+            logger.info(f"DEBUG: Config bf16: {self.cfg.common.bf16}")
         self._set_seed()
         self.model.train()
         self.criterion.train()
@@ -768,6 +796,9 @@ class Trainer(object):
                     )
                     del loss
 
+                logging_output = utils.apply_to_sample(
+                    lambda t: t.detach() if torch.is_tensor(t) else t, logging_output
+                )
                 logging_outputs.append(logging_output)
                 sample_size += sample_size_i
 

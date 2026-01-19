@@ -44,7 +44,7 @@ def is_master(cfg: DistributedTrainingConfig):
 
 
 def infer_init_method(cfg: DistributedTrainingConfig, force_distributed=False):
-    if cfg.distributed_init_method is not None or cfg.tpu:
+    if cfg.distributed_init_method is not None or (cfg.tpu and not torch.cuda.is_available()):
         return
 
     num_pipelines_per_node = None
@@ -242,7 +242,7 @@ def distributed_init(cfg: FairseqConfig):
 
         cfg = convert_namespace_to_omegaconf(cfg)
 
-    if not cfg.common.tpu:
+    if not cfg.common.tpu or torch.cuda.is_available():
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             warnings.warn(
                 "Distributed is already initialized, cannot initialize twice!"
@@ -254,6 +254,11 @@ def distributed_init(cfg: FairseqConfig):
                     cfg.distributed_training.distributed_init_method,
                 )
             )
+            if torch.cuda.is_available() and not cfg.common.cpu and not cfg.common.tpu:
+                local_rank = os.environ.get("LOCAL_RANK")
+                if local_rank is not None:
+                    cfg.distributed_training.device_id = int(local_rank)
+                    torch.cuda.set_device(cfg.distributed_training.device_id)
             dist.init_process_group(
                 backend=cfg.distributed_training.distributed_backend,
                 init_method=cfg.distributed_training.distributed_init_method,
@@ -352,7 +357,7 @@ def call_main(cfg: FairseqConfig, main, **kwargs):
             )
         else:
             distributed_main(cfg.distributed_training.device_id, main, cfg, kwargs)
-    elif cfg.common.tpu and cfg.distributed_training.distributed_world_size > 1:
+    elif cfg.common.tpu and cfg.distributed_training.distributed_world_size > 1 and not torch.cuda.is_available():
         import torch_xla.distributed.xla_multiprocessing as xmp
 
         torch.multiprocessing.set_sharing_strategy("file_system")
